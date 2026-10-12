@@ -1,0 +1,13 @@
+# Large files that should NOT go into git
+data/
+features/
+results/*.png
+
+# Python / editor junk
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+.vscode/
+.DS_Store

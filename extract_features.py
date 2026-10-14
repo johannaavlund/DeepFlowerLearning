@@ -18,8 +18,9 @@ Usage examples:
     python extract_features.py --data-root data/flowers --model dinov3
     python extract_features.py --data-root data/flowers --model dinov3 --limit 20   # quick test
 
-    # Grayscale experiment: extracts only the test images, converted to grayscale
-    python extract_features.py --data-root data/flowers --model resnet50 --grayscale
+    # Robustness experiment: extracts only the TEST images, with perturbations
+    python extract_features.py --data-root data/flowers --model resnet50 \
+        --perturb gray rotate dark blur crop
 """
 
 import argparse
@@ -30,6 +31,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
+from PIL import Image, ImageEnhance, ImageFilter
 from tqdm import tqdm
 
 # Hugging Face model id for DINOv3 ViT-B/16 (gated: accept the licence on the
@@ -86,6 +88,50 @@ def build_backbone(name: str, pretrained: bool, device: torch.device):
     return forward, transform
 
 
+# ---------------------------------------------------------------------------
+# Perturbations for the robustness experiment.
+# Each one is applied to the PIL image after resizing to 256 pixels (shorter
+# side) and before the 224x224 center crop, so its strength is the same for
+# every image regardless of its original resolution. They are classes (not
+# lambdas) so the DataLoader can use several worker processes on macOS.
+# ---------------------------------------------------------------------------
+class Gray:
+    """Remove colour (tests colour dependence)."""
+    def __call__(self, im):
+        return im.convert("L").convert("RGB")
+
+
+class Rotate90:
+    """Rotate by 90 degrees (tests viewpoint/orientation)."""
+    def __call__(self, im):
+        return im.rotate(90, expand=True)
+
+
+class Dark:
+    """Reduce brightness to 40% (tests lighting)."""
+    def __call__(self, im):
+        return ImageEnhance.Brightness(im).enhance(0.4)
+
+
+class Blur:
+    """Gaussian blur, radius 4 px at 256 px resolution (tests image quality)."""
+    def __call__(self, im):
+        return im.filter(ImageFilter.GaussianBlur(radius=4))
+
+
+class ZoomCrop:
+    """Keep only the central 50% (side length) and scale back up (tests scale /
+    partial view of the flower)."""
+    def __call__(self, im):
+        w, h = im.size
+        box = (w // 4, h // 4, w - w // 4, h - h // 4)
+        return im.crop(box).resize((w, h), Image.BICUBIC)
+
+
+PERTURBATIONS = {"gray": Gray(), "rotate": Rotate90(), "dark": Dark(),
+                 "blur": Blur(), "crop": ZoomCrop()}
+
+
 def find_splits(data_root: str):
     """Return the split folders (train/val/test) that exist under data_root."""
     splits = [s for s in ("train", "val", "test")
@@ -120,9 +166,9 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--limit", type=int, default=None,
                         help="Only use N random images per split (for quick tests).")
-    parser.add_argument("--grayscale", action="store_true",
-                        help="Extract grayscale versions of the TEST images only "
-                             "(for the colour-dependence experiment).")
+    parser.add_argument("--perturb", nargs="+", choices=list(PERTURBATIONS),
+                        help="Robustness experiment: extract perturbed versions of "
+                             "the TEST images only, one file per perturbation.")
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -137,27 +183,20 @@ def main():
         device = torch.device("cpu")
     print(f"Device: {device}")
 
-    forward, transform = build_backbone(args.model, not args.random_init, device)
-
-    if args.grayscale:
-        # Convert every image to grayscale (copied to 3 channels so the
-        # networks still get the input shape they expect). Everything else
-        # in the preprocessing stays the same.
-        transform = transforms.Compose(
-            [transforms.Grayscale(num_output_channels=3)] + transform.transforms)
+    forward, base_transform = build_backbone(args.model, not args.random_init, device)
 
     dataset_name = os.path.basename(os.path.normpath(args.data_root))
     tag = f"{args.model}{'_random' if args.random_init else ''}"
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # Which splits to extract. In grayscale mode only the TEST images are
-    # needed (the KNN reference set stays in colour):
+    # Which splits to extract. In perturbation mode only the TEST images are
+    # needed (the KNN reference set stays unchanged):
     #   - dataset with a 'test' folder (Flowers-102): extract 'test' only
     #   - otherwise (Kaggle-14): extract only the held-out test images listed
     #     in features/<dataset>_split.npz (created by knn_eval.py)
     splits = find_splits(args.data_root)
     keep_paths = None
-    if args.grayscale:
+    if args.perturb:
         if "test" in splits:
             splits = ["test"]
         else:
@@ -167,42 +206,54 @@ def main():
             keep_paths = set(np.load(split_file)["test_paths"])
             splits = ["train"]
 
-    class_names = None
-    for split in splits:
-        ds = datasets.ImageFolder(os.path.join(args.data_root, split), transform=transform)
-
-        # Make sure every split uses the same class -> index mapping as train.
-        if class_names is None:
-            class_names = ds.classes
-        elif ds.classes != class_names:
-            raise ValueError(f"Classes in '{split}' differ from 'train'.")
-
-        paths = [p for p, _ in ds.samples]
-        if keep_paths is not None:
-            idx = [i for i, p in enumerate(paths) if p in keep_paths]
-            if not idx:
-                raise ValueError("No test images matched the saved split. Use the "
-                                 "same --data-root as when the split was created.")
-            ds = Subset(ds, idx)
-            paths = [paths[i] for i in idx]
-        if args.limit:
-            idx = random.sample(range(len(ds)), min(args.limit, len(ds)))
-            ds = Subset(ds, idx)
-            paths = [paths[i] for i in idx]
-
-        print(f"[{split}] {len(ds)} images, {len(class_names)} classes")
-        loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers,
-                            pin_memory=device.type == "cuda")
-        feats, labels = extract(forward, loader, device)
-
-        if args.grayscale:
-            out_path = os.path.join(args.out_dir, f"{dataset_name}_{tag}_gray_test.npz")
+    # One pass per perturbation (or a single normal pass without --perturb).
+    for perturb in (args.perturb or [None]):
+        if perturb is None:
+            transform = base_transform
         else:
-            out_path = os.path.join(args.out_dir, f"{dataset_name}_{tag}_{split}.npz")
-        np.savez_compressed(out_path, features=feats, labels=labels,
-                            paths=np.array(paths), class_names=np.array(class_names))
-        print(f"  saved {feats.shape} -> {out_path}")
+            # Insert the perturbation right after Resize(256).
+            steps = base_transform.transforms
+            transform = transforms.Compose([steps[0], PERTURBATIONS[perturb]] + steps[1:])
+            print(f"=== Perturbation: {perturb} ===")
+
+        class_names = None
+        for split in splits:
+            ds = datasets.ImageFolder(os.path.join(args.data_root, split),
+                                      transform=transform)
+
+            # Make sure every split uses the same class -> index mapping as train.
+            if class_names is None:
+                class_names = ds.classes
+            elif ds.classes != class_names:
+                raise ValueError(f"Classes in '{split}' differ from 'train'.")
+
+            paths = [p for p, _ in ds.samples]
+            if keep_paths is not None:
+                idx = [i for i, p in enumerate(paths) if p in keep_paths]
+                if not idx:
+                    raise ValueError("No test images matched the saved split. Use the "
+                                     "same --data-root as when the split was created.")
+                ds = Subset(ds, idx)
+                paths = [paths[i] for i in idx]
+            if args.limit:
+                idx = random.sample(range(len(ds)), min(args.limit, len(ds)))
+                ds = Subset(ds, idx)
+                paths = [paths[i] for i in idx]
+
+            print(f"[{split}] {len(ds)} images, {len(class_names)} classes")
+            loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
+                                num_workers=args.num_workers,
+                                pin_memory=device.type == "cuda")
+            feats, labels = extract(forward, loader, device)
+
+            if perturb is None:
+                name = f"{dataset_name}_{tag}_{split}.npz"
+            else:
+                name = f"{dataset_name}_{tag}_{perturb}_test.npz"
+            out_path = os.path.join(args.out_dir, name)
+            np.savez_compressed(out_path, features=feats, labels=labels,
+                                paths=np.array(paths), class_names=np.array(class_names))
+            print(f"  saved {feats.shape} -> {out_path}")
 
 
 if __name__ == "__main__":

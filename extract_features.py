@@ -17,6 +17,9 @@ Usage examples:
     python extract_features.py --data-root data/flowers --model resnet50
     python extract_features.py --data-root data/flowers --model dinov3
     python extract_features.py --data-root data/flowers --model dinov3 --limit 20   # quick test
+
+    # Grayscale experiment: extracts only the test images, converted to grayscale
+    python extract_features.py --data-root data/flowers --model resnet50 --grayscale
 """
 
 import argparse
@@ -117,6 +120,9 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--limit", type=int, default=None,
                         help="Only use N random images per split (for quick tests).")
+    parser.add_argument("--grayscale", action="store_true",
+                        help="Extract grayscale versions of the TEST images only "
+                             "(for the colour-dependence experiment).")
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -133,12 +139,36 @@ def main():
 
     forward, transform = build_backbone(args.model, not args.random_init, device)
 
+    if args.grayscale:
+        # Convert every image to grayscale (copied to 3 channels so the
+        # networks still get the input shape they expect). Everything else
+        # in the preprocessing stays the same.
+        transform = transforms.Compose(
+            [transforms.Grayscale(num_output_channels=3)] + transform.transforms)
+
     dataset_name = os.path.basename(os.path.normpath(args.data_root))
     tag = f"{args.model}{'_random' if args.random_init else ''}"
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # Which splits to extract. In grayscale mode only the TEST images are
+    # needed (the KNN reference set stays in colour):
+    #   - dataset with a 'test' folder (Flowers-102): extract 'test' only
+    #   - otherwise (Kaggle-14): extract only the held-out test images listed
+    #     in features/<dataset>_split.npz (created by knn_eval.py)
+    splits = find_splits(args.data_root)
+    keep_paths = None
+    if args.grayscale:
+        if "test" in splits:
+            splits = ["test"]
+        else:
+            split_file = os.path.join(args.out_dir, f"{dataset_name}_split.npz")
+            if not os.path.exists(split_file):
+                raise FileNotFoundError(f"{split_file} not found. Run knn_eval.py first.")
+            keep_paths = set(np.load(split_file)["test_paths"])
+            splits = ["train"]
+
     class_names = None
-    for split in find_splits(args.data_root):
+    for split in splits:
         ds = datasets.ImageFolder(os.path.join(args.data_root, split), transform=transform)
 
         # Make sure every split uses the same class -> index mapping as train.
@@ -148,6 +178,13 @@ def main():
             raise ValueError(f"Classes in '{split}' differ from 'train'.")
 
         paths = [p for p, _ in ds.samples]
+        if keep_paths is not None:
+            idx = [i for i, p in enumerate(paths) if p in keep_paths]
+            if not idx:
+                raise ValueError("No test images matched the saved split. Use the "
+                                 "same --data-root as when the split was created.")
+            ds = Subset(ds, idx)
+            paths = [paths[i] for i in idx]
         if args.limit:
             idx = random.sample(range(len(ds)), min(args.limit, len(ds)))
             ds = Subset(ds, idx)
@@ -159,7 +196,10 @@ def main():
                             pin_memory=device.type == "cuda")
         feats, labels = extract(forward, loader, device)
 
-        out_path = os.path.join(args.out_dir, f"{dataset_name}_{tag}_{split}.npz")
+        if args.grayscale:
+            out_path = os.path.join(args.out_dir, f"{dataset_name}_{tag}_gray_test.npz")
+        else:
+            out_path = os.path.join(args.out_dir, f"{dataset_name}_{tag}_{split}.npz")
         np.savez_compressed(out_path, features=feats, labels=labels,
                             paths=np.array(paths), class_names=np.array(class_names))
         print(f"  saved {feats.shape} -> {out_path}")
